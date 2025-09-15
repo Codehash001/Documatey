@@ -5,13 +5,13 @@ import { getGeminiModel } from '@/lib/llm';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SYSTEM = `You are a helpful developer assistant. Answer user questions and help troubleshoot errors using ONLY the provided context snippets.
-Rules:
-- If the user's tech stack is evident (e.g., Next.js/TypeScript), avoid giving examples from other stacks (e.g., Python) unless requested.
-- Prefer concise, actionable answers with minimal but necessary steps.
-- When relevant, include code blocks and reference links.
-- Always include citations to the most relevant sources from the provided snippets.
-Return strictly valid JSON with this shape:
+const SYSTEM = `You are a helpful developer assistant. Answer using ONLY the selected step's context and retrieved snippets.
+Strict rules:
+- STEP_DETAIL is the source of truth. Do not contradict it.
+- Infer the technology stack from STEP_DETAIL and its citations; do not switch stacks unless explicitly asked.
+- Provide the best possible, concise answer with actionable steps and code matching the inferred stack.
+- Always include citations to sources used.
+Return strictly valid JSON:
 {
   "answer": string,
   "citations": [ { "url": string, "evidence": string } ]
@@ -21,66 +21,87 @@ function getHost(u?: string | null) {
   try { return u ? new URL(u).host : ''; } catch { return ''; }
 }
 
-function inferDominantHost(results: { source_url: string | null }[], hintText: string) {
-  const counts = new Map<string, number>();
-  for (const r of results) {
-    const host = getHost(r.source_url);
-    if (!host) continue;
-    counts.set(host, (counts.get(host) || 0) + 1);
-  }
-  const lower = hintText.toLowerCase();
-  let bestHost = '';
-  let bestScore = -1;
-  for (const [host, cnt] of counts) {
-    const name = host.split('.').slice(-2, -1)[0] || host;
-    const bias = lower.includes(name) ? 2 : 1;
-    const score = cnt * bias;
-    if (score > bestScore) { bestScore = score; bestHost = host; }
-  }
-  return bestScore > 0 ? bestHost : '';
-}
-
 function buildContext(snippets: { source_url: string | null; content: string }[]) {
   return snippets
     .map((r, i) => `[#${i + 1}] URL: ${r.source_url || 'n/a'}\n${r.content}`)
     .join('\n---\n');
 }
 
+// Gemini accepts roles: 'user' | 'model'. Map any 'assistant' history entries to 'model'.
+function toGeminiRole(role: 'user' | 'assistant'): 'user' | 'model' {
+  return role === 'assistant' ? 'model' : 'user';
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { message, topK = 8, filters, history } = body as {
+    const {
+      message,
+      topK = 5,
+      filters,
+      history,
+      stepId,
+      stepDetail,
+      stepCitations,
+      assumptions,
+      strict
+    } = body as {
       message?: string;
       topK?: number;
       filters?: { sourceHost?: string; sourcePrefix?: string };
       history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+      stepId?: string;
+      stepDetail?: string;
+      stepCitations?: Array<{ url: string; evidence?: string }>;
+      assumptions?: string[];
+      strict?: boolean;
     };
     if (!message) return NextResponse.json({ error: 'message is required' }, { status: 400 });
 
-    const historyText = Array.isArray(history)
-      ? history.slice(-4).map((h) => `${h.role.toUpperCase()}: ${h.content}`).join('\n')
-      : '';
-    const retrievalQuery = [historyText, `USER: ${message}`].filter(Boolean).join('\n');
+    // Derive a sourceHost from citations when possible
+    const citedHosts = Array.isArray(stepCitations)
+      ? Array.from(new Set(stepCitations.map((c) => getHost(c?.url)).filter(Boolean)))
+      : [];
+    const singleHost = citedHosts.length === 1 ? citedHosts[0] : undefined;
 
-    const initial = await semanticSearch(retrievalQuery, Number(topK) || 8, filters);
+    // Retrieval query uses only stepDetail, assumptions, and the question.
+    // We ignore chat history for retrieval to avoid drifting off-step.
+    const retrievalQuery = [
+      assumptions && assumptions.length ? `ASSUMPTIONS:\n${assumptions.join('\n')}` : '',
+      stepDetail ? `STEP_DETAIL:\n${stepDetail}` : '',
+      `USER: ${message}`,
+    ].filter(Boolean).join('\n');
 
-    // Agentic domain selection when filters not provided
-    let results = initial;
-    if (!filters?.sourceHost && !filters?.sourcePrefix) {
-      const dominantHost = inferDominantHost(initial, retrievalQuery);
-      if (dominantHost) {
-        results = initial.filter((r) => (r.source_url || '').includes(`://${dominantHost}`));
+    // Strict mode: constrain retrieval to the step's cited host (if available) and do not fallback.
+    // Non-strict: try cited host if unambiguous, then fallback to global if empty.
+    let results = [] as Awaited<ReturnType<typeof semanticSearch>>;
+    if (strict) {
+      const effFilters = singleHost ? { sourceHost: singleHost } : filters;
+      results = await semanticSearch(retrievalQuery, Number(topK) || 5, effFilters);
+    } else {
+      if (singleHost) {
+        results = await semanticSearch(retrievalQuery, Number(topK) || 5, { sourceHost: singleHost });
+        if (!results || results.length === 0) {
+          results = await semanticSearch(retrievalQuery, Math.max(3, (Number(topK) || 5) - 2), undefined);
+        }
+      } else {
+        results = await semanticSearch(retrievalQuery, Number(topK) || 5, filters);
+        if (!results || results.length === 0) {
+          results = await semanticSearch(retrievalQuery, Math.max(3, (Number(topK) || 5) - 2), undefined);
+        }
       }
     }
 
-    const contextText = buildContext(results);
+    const retrieved = buildContext(results);
 
     const model = getGeminiModel();
     const res = await model.generateContent({
       contents: [
         { role: 'user', parts: [{ text: SYSTEM }] },
-        ...(history ? history.map((h) => ({ role: h.role, parts: [{ text: h.content }] }) as any) : []),
-        { role: 'user', parts: [{ text: `CONTEXT:\n${contextText || '(no matching context)'}` }] },
+        ...(history ? history.map((h) => ({ role: toGeminiRole(h.role), parts: [{ text: h.content }] }) as any) : []),
+        { role: 'user', parts: [{ text: `STEP_DETAIL:\n${stepDetail || '(missing)'}\n\n${assumptions && assumptions.length ? 'ASSUMPTIONS:\n' + assumptions.join('\n') : ''}` }] },
+        { role: 'user', parts: [{ text: `CITATIONS:\n${Array.isArray(stepCitations) && stepCitations.length ? stepCitations.map((c, i) => `[${i + 1}] ${c.url} — ${c.evidence || ''}`).join('\n') : '(none provided)'}` }] },
+        { role: 'user', parts: [{ text: `RETRIEVED_CONTEXT:\n${retrieved || '(no matching context)'}` }] },
         { role: 'user', parts: [{ text: `QUESTION:\n${message}` }] },
       ],
       generationConfig: { responseMimeType: 'application/json' } as any,
@@ -89,9 +110,17 @@ export async function POST(req: NextRequest) {
     const text = res.response?.text?.() || '';
     let json: any = null;
     try { json = JSON.parse(text); } catch {}
+
     if (!json?.answer) {
-      return NextResponse.json({ answer: 'Sorry, I could not find a precise answer from the provided context.', citations: [] });
+      const backupAnswer = stepDetail
+        ? `Based on the selected step, here is the guidance:\n\n${stepDetail}`
+        : 'Here is the best available guidance from the provided context.';
+      const backupCitations = Array.isArray(stepCitations)
+        ? stepCitations.slice(0, 3).map((c) => ({ url: c.url, evidence: c.evidence || '' }))
+        : [];
+      return NextResponse.json({ answer: backupAnswer, citations: backupCitations });
     }
+
     return NextResponse.json(json);
   } catch (err: any) {
     return NextResponse.json({ error: String(err?.message || err) }, { status: 500 });

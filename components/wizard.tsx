@@ -1,6 +1,6 @@
 'use client'
 
-import { JSX, useMemo, useState, useEffect } from 'react'
+import { JSX, useMemo, useState, useEffect, useRef } from 'react'
 import Image from 'next/image'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -80,6 +80,12 @@ export default function Wizard() {
 
   // Sticky measurements
   const [headerH, setHeaderH] = useState(0)
+
+  // Chat auto-scroll
+  const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages])
 
   useEffect(() => {
     const measure = () => {
@@ -199,13 +205,67 @@ export default function Wizard() {
     const asstId = `a-${Date.now()}`
     const placeholder = { id: asstId, role: 'assistant' as const, content: 'Thinking…', status: 'thinking' as const }
     setChatMessages((prev) => [...prev, userMsg, placeholder])
+    const toSend = chatInput
     setChatInput('')
     setChatAnswer(null)
     try {
+      // Ensure we have the selected step's detail and citations available in this scope
+      const steps = Array.isArray(plan?.steps) ? (plan as any).steps : []
+      const idx = steps.findIndex((x: any, i: number) => (x.id || String(i)) === selectedStepId)
+      const step = idx >= 0 ? steps[idx] : null
+      const stepDetail: string = String(step?.detail || '')
+      const stepCitations: Array<{ url: string; evidence?: string }> = Array.isArray(step?.citations) ? step.citations : []
+      const assumptions: string[] = Array.isArray((plan as any)?.assumptions) ? (plan as any).assumptions : []
+
+      // Derive host filter from citations (single host only)
+      const hosts = Array.from(new Set(stepCitations.map((c) => { try { return new URL(c.url).host } catch { return '' } }).filter(Boolean)))
+      const hostFilter: { sourceHost?: string } | undefined = hosts.length === 1 ? { sourceHost: hosts[0] } : undefined
+      // Provide slim chat history for grounding (skip thinking placeholders)
+      const history = chatMessages
+        .filter((m) => m.status !== 'thinking')
+        .slice(-6)
+        .map((m) => ({ role: m.role, content: m.content }))
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: chatInput, stepId: selectedStepId }),
+        body: JSON.stringify({
+          message: toSend,
+          stepId: selectedStepId,
+          stepDetail,
+          stepCitations,
+          assumptions,
+          history,
+          // strengthen filter using a common path prefix if available
+          filters: (() => {
+            if (!hostFilter) return undefined
+            try {
+              const urls = stepCitations
+                .map((c) => { try { return new URL(c.url) } catch { return null } })
+                .filter((u): u is URL => !!u)
+              if (urls.length < 2) return hostFilter
+              // compute common pathname prefix
+              const paths = urls.map((u) => u.pathname.split('/').filter(Boolean))
+              const minLen = Math.min(...paths.map((p) => p.length))
+              const commonParts: string[] = []
+              for (let i = 0; i < minLen; i++) {
+                const part = paths[0][i]
+                if (paths.every((p) => p[i] === part)) commonParts.push(part)
+                else break
+              }
+              if (commonParts.length >= 1) {
+                const u0 = urls[0]
+                const prefix = `${u0.protocol}//${u0.host}/${commonParts.join('/')}`
+                return { ...hostFilter, sourcePrefix: prefix }
+              }
+              return hostFilter
+            } catch {
+              return hostFilter
+            }
+          })(),
+          topK: 5,
+          strict: true,
+        }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Failed to get answer')
@@ -434,12 +494,10 @@ export default function Wizard() {
           </div>
           <div className="flex items-center gap-3">
             {isOutcome && (
-              <Button variant="destructive" onClick={confirmAndHome} className="mr-2">
+              <Button variant="outline" onClick={confirmAndHome} className="mr-2">
                 Back to Home
               </Button>
             )}
-            {!isOutcome && <div className="text-sm opacity-70">Step {step} of 4</div>}
-            {isOutcome && <div className="text-sm font-medium opacity-90">Generated Plan</div>}
             <ThemeToggle />
           </div>
         </div>
@@ -454,7 +512,7 @@ export default function Wizard() {
                 {step === 1 && (
                   <div>
                     <CardTitle>Step 1 · Index Documentation</CardTitle>
-                    <CardDescription>Paste a documentation URL to crawl (same host) or paste raw text.</CardDescription>
+                    <CardDescription>Paste a documentation URL to crawl or paste raw text.</CardDescription>
                   </div>
                 )}
                 {step === 2 && (
@@ -563,7 +621,7 @@ export default function Wizard() {
                       )}
                     </div>
 
-                    {/* Plan preview (skeleton if not yet generated) */}
+                    {/* Plan preview */}
                     {plan ? (
                       <div className="grid gap-3">
                         {Array.isArray(plan.assumptions) && plan.assumptions.length > 0 && (
@@ -581,7 +639,7 @@ export default function Wizard() {
                             <div className="text-sm font-semibold tracking-tight">Proposed steps</div>
                             <ol className="grid gap-2">
                               {plan.steps.map((s: any, i: number) => (
-                                <li key={s.id || i} className="rounded-md border border-black/5 dark:border-white/10 bg-white/50 dark:bg-neutral-950/40 p-3">
+                                <li key={s.id || i} className="rounded-md border border-black/10 dark:border-white/10 bg-white/50 dark:bg-neutral-950/40 p-3">
                                   <div className="text-sm font-medium">{s.title}</div>
                                   <div className="mt-2">{renderDetail(String(s.detail || ''), s.citations)}</div>
                                 </li>
@@ -617,9 +675,9 @@ export default function Wizard() {
               </CardFooter>
             </Card>
           ) : (
-            // Outcome workspace: full width, two-column
+            // Outcome workspace
             <div className="grid grid-cols-[3fr_2fr] gap-6 min-h-0 h-full">
-              <div className="grid grid-rows-[auto_1fr] gap-4 min-h-0 h-full min-w-0 mb-3">
+              <div className="grid grid-rows-[auto_1fr] gap-4 min-h-0 h-full min-w-0">
                 <div className="flex items-center justify-between">
                   <div className="text-base font-semibold">Build Plan</div>
                   {Array.isArray(plan?.steps) && plan!.steps.length > 0 && (
@@ -639,7 +697,7 @@ export default function Wizard() {
                   )}
                 </div>
                 {Array.isArray(plan?.steps) && plan!.steps.length > 0 ? (
-                  <ol className="grid gap-3 overflow-auto min-h-0 h-full pr-1">
+                  <ol className="grid gap-3 overflow-auto min-h-0 h-full pr-1 pb-6">
                     {plan!.steps.map((s: any, i: number) => {
                       const id = s.id || String(i)
                       const isOpen = !!expanded[id]
@@ -694,8 +752,10 @@ export default function Wizard() {
 
               {/* Chat panel (sticky) */}
               <div className="col-span-1 min-w-0">
-                <div className="sticky grid grid-rows-[auto_1fr_auto] gap-3 bg-transparent"
-                     style={{ top: headerH, height: `calc(100dvh - ${headerH}px)` }}>
+                <div
+                  className="sticky grid grid-rows-[auto_minmax(0,1fr)_auto] gap-3 bg-transparent min-h-0 box-border"
+                  style={{ top: headerH + 10, height: `calc(100dvh - ${headerH}px - 20px)` }}
+                >
                   {/* Header */}
                   <div className="grid gap-1">
                     <div className="text-base font-semibold">Chat helper</div>
@@ -705,18 +765,21 @@ export default function Wizard() {
                   </div>
 
                   {/* Scrollable answer area */}
-                  <div className="min-h-0 overflow-auto rounded-md border border-black/10 dark:border-white/10 bg-white/70 dark:bg-neutral-950/40 p-3">
+                  <div className="min-h-0 overflow-auto rounded-xl border border-black/10 dark:border-white/10 bg-white/70 dark:bg-neutral-950/40 p-3 pb-2 shadow-sm">
                     {chatMessages.length === 0 ? (
                       <div className="text-xs opacity-70">Ask a question about the selected step. The conversation will appear here.</div>
                     ) : (
                       <div className="grid gap-3">
                         {chatMessages.map((m) => (
                           <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                            <div className={`${m.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white/90 dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100'} rounded-lg px-3 py-2 max-w-[90%] shadow-sm`}>
+                            <div className={`${m.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gradient-to-b from-white/90 to-white/80 dark:from-neutral-900 dark:to-neutral-950 text-neutral-900 dark:text-neutral-100'} rounded-2xl px-3 py-2 max-w-[90%] shadow-sm border border-black/5 dark:border-white/10`}> 
                               {m.status === 'thinking' ? (
-                                <div className="text-xs opacity-80">Thinking…</div>
+                                <div className="text-xs opacity-80 flex items-center gap-2">
+                                  <span className="relative flex h-2 w-2"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-current opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-current"></span></span>
+                                  Thinking…
+                                </div>
                               ) : (
-                                <div className="prose prose-sm dark:prose-invert max-w-none">
+                                <div className="prose dark:prose-invert max-w-none text-[13px] leading-5">
                                   <ReactMarkdown rehypePlugins={[rehypeHighlight]} components={mkMarkdownComponents()}>
                                     {m.content}
                                   </ReactMarkdown>
@@ -738,19 +801,28 @@ export default function Wizard() {
                             </div>
                           </div>
                         ))}
+                        <div ref={messagesEndRef} />
                       </div>
                     )}
                   </div>
 
                   {/* Composer fixed at bottom of panel */}
-                  <div className="flex items-end gap-2 mb-3">
+                  <div className="flex items-end gap-2 mt-2 pb-6">
                     <Textarea
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          if (!busy && chatInput.trim()) {
+                            askChat();
+                          }
+                        }
+                      }}
                       placeholder="Ask about the selected step…"
-                      className="min-h-[48px] max-h-[120px] resize-none rounded-lg border-black/10 dark:border-white/10 focus-visible:ring-2"
+                      className="min-h-[40px] max-h-[120px] resize-none rounded-xl border-black/10 dark:border-white/10 focus-visible:ring-2 bg-white/90 dark:bg-neutral-900 text-sm"
                     />
-                    <Button onClick={askChat} disabled={busy || !chatInput.trim()} className="h-[48px] px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white shadow">
+                    <Button onClick={askChat} disabled={busy || !chatInput.trim()} className="h-[44px] px-4 rounded-full bg-blue-600 hover:bg-blue-500 text-white shadow">
                       <Send className="h-4 w-4" />
                       <span className="sr-only">Send</span>
                     </Button>
@@ -780,7 +852,7 @@ export default function Wizard() {
       )}
 
       {/* Toast */}
-      {(notice || error) && (
+      {(notice || error && notice != 'Thinking…') && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
           <div className={`rounded-md px-4 py-2 shadow-lg text-sm ${error ? 'bg-red-600 text-white' : 'bg-black/80 text-white'} backdrop-blur`}> 
             {error || notice}
